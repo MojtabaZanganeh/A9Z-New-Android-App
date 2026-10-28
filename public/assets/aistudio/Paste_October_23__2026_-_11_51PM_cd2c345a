@@ -1,0 +1,1477 @@
+<?php
+
+/////////////// CORS Policy \\\\\\\\\\\\\\\
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    header("Access-Control-Allow-Origin: *");
+    header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+    header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, api-key");
+    http_response_code(200);
+    exit();
+}
+
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, api-key");
+/////////////// End \\\\\\\\\\\\\\\
+
+/////////////// Security \\\\\\\\\\\\\\\
+$site_url = 'https://a9z.ir/';
+
+require 'vendor/autoload.php';
+$dotenv = Dotenv\Dotenv::createImmutable(__DIR__);
+$dotenv->load();
+
+$API_KEY = $_ENV['API_KEY'];
+$JWT_SECRET_KEY = $_ENV['JWT_SECRET_KEY'];
+$USER_USERNAME = $_ENV['USER_USERNAME'];
+$USER_PASSWORD = $_ENV['USER_PASSWORD'];
+$ADMIN_USERNAME = $_ENV['ADMIN_USERNAME'];
+$ADMIN_PASSWORD = $_ENV['ADMIN_PASSWORD'];
+$GIT_TOKEN = $_ENV['GIT_TOKEN'];
+
+$header = getallheaders()["api-key"] ?? null;
+if (is_null($header)) {
+    header("Location: $site_url");
+    die("You Not Access To This API");
+}
+if (!is_null($header) && $header != $API_KEY) {
+    header("Location: $site_url");
+    die("You Not Access To This API");
+}
+
+/////////////// URI \\\\\\\\\\\\\\\
+$path = parse_url(htmlspecialchars($_SERVER['PATH_INFO']), PHP_URL_PATH);
+$path = ltrim($path, '/');
+
+/////////////// Storage & Data Directory \\\\\\\\\\\\\\\
+$data_dir = __DIR__ . '/data';
+if (!is_dir($data_dir)) {
+    @mkdir($data_dir, 0755, true);
+    @file_put_contents($data_dir . '/.htaccess', "Deny from all\n");
+}
+
+function get_storage_path($filename)
+{
+    global $data_dir;
+    $new_path = $data_dir . '/' . $filename;
+    $old_path = __DIR__ . '/' . $filename;
+    if (!file_exists($new_path) && file_exists($old_path)) {
+        @rename($old_path, $new_path);
+    }
+    return file_exists($new_path) ? $new_path : (file_exists($old_path) ? $old_path : $new_path);
+}
+
+// Auto-migrate known data files from root to data directory if present in root
+$migratable_files = [
+    'configs.txt',
+    'configs.txt_update_time.txt',
+    'last_configs.txt',
+    'history.json',
+    'sub.txt',
+    'sub_raw.txt',
+    'pxs.txt',
+    'pxs.txt_update_time.txt',
+    'last_pxs.txt',
+    'pxs_history.json',
+    'links.json',
+    'login.json',
+    'windscribe_emails.json',
+    'windscribe_quota.json',
+    'settings.json'
+];
+foreach ($migratable_files as $f) {
+    $src = __DIR__ . '/' . $f;
+    $dst = $data_dir . '/' . $f;
+    if (file_exists($src) && !file_exists($dst)) {
+        @rename($src, $dst);
+    }
+}
+
+/////////////// Files \\\\\\\\\\\\\\\
+$config_file = get_storage_path('configs.txt');
+$px_file = get_storage_path('pxs.txt');
+$history_file = get_storage_path('history.json');
+$sub_file = get_storage_path('sub.txt');
+$sub_file_raw = get_storage_path('sub_raw.txt');
+$links_file = get_storage_path('links.json');
+$settings_file = get_storage_path('settings.json');
+
+function get_app_settings()
+{
+    $settings_file = get_storage_path('settings.json');
+    $default = [
+        'windscribe_max_emails' => 3,
+        'windscribe_period_days' => 30,
+        'windscribe_lifespan_minutes' => 5
+    ];
+    if (!file_exists($settings_file)) {
+        return $default;
+    }
+    $raw = @file_get_contents($settings_file);
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        return $default;
+    }
+    return [
+        'windscribe_max_emails' => isset($data['windscribe_max_emails']) ? max(1, (int)$data['windscribe_max_emails']) : 3,
+        'windscribe_period_days' => isset($data['windscribe_period_days']) ? max(1, (int)$data['windscribe_period_days']) : 30,
+        'windscribe_lifespan_minutes' => isset($data['windscribe_lifespan_minutes']) ? max(1, (int)$data['windscribe_lifespan_minutes']) : 5
+    ];
+}
+$login_file = get_storage_path('login.json');
+
+/////////////// Classes \\\\\\\\\\\\\\\
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
+
+/////////////// Functions \\\\\\\\\\\\\\\
+function encrypt_config($data)
+{
+    global $API_KEY;
+    $iv = openssl_random_pseudo_bytes(16);
+    $encrypted = openssl_encrypt($data, 'aes-256-cbc', $API_KEY, 0, $iv);
+    return base64_encode($encrypted . '::' . $iv);
+}
+
+function decrypt_config($data)
+{
+    global $API_KEY;
+    list($encrypted_data, $iv) = explode('::', base64_decode($data), 2);
+    return openssl_decrypt($encrypted_data, 'aes-256-cbc', $API_KEY, 0, $iv);
+}
+
+function generate_cpanel_100_password($length = 24)
+{
+    $uppers = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    $lowers = 'abcdefghijkmnpqrstuvwxyz';
+    $numbers = '23456789';
+    $symbols = '!@#$%^&*()_+-=~';
+
+    $pass = [];
+    for ($i = 0; $i < 4; $i++) {
+        $pass[] = $uppers[random_int(0, strlen($uppers) - 1)];
+        $pass[] = $lowers[random_int(0, strlen($lowers) - 1)];
+        $pass[] = $numbers[random_int(0, strlen($numbers) - 1)];
+        $pass[] = $symbols[random_int(0, strlen($symbols) - 1)];
+    }
+
+    $all = $uppers . $lowers . $numbers . $symbols;
+    while (count($pass) < $length) {
+        $pass[] = $all[random_int(0, strlen($all) - 1)];
+    }
+
+    shuffle($pass);
+    return implode('', $pass);
+}
+
+function get_windscribe_usage_count($fingerprint, $cookie_id, $local_id, $ip, $period_days = 30)
+{
+    $quota_file = get_storage_path('windscribe_quota.json');
+    if (!file_exists($quota_file)) return 0;
+    $raw = @file_get_contents($quota_file);
+    $records = json_decode($raw, true) ?: [];
+    $cutoff = time() - ($period_days * 86400); // dynamic window based on settings
+    $matched_emails = [];
+
+    $has_device_id = !empty($fingerprint) || !empty($cookie_id) || !empty($local_id);
+
+    foreach ($records as $r) {
+        if (($r['timestamp'] ?? 0) < $cutoff) continue;
+        $is_match = false;
+
+        // 1. Precise device identification (Cookie, LocalStorage ID, Hardware Fingerprint)
+        if (!empty($fingerprint) && !empty($r['fingerprint']) && $r['fingerprint'] === $fingerprint) {
+            $is_match = true;
+        } elseif (!empty($cookie_id) && !empty($r['cookie_id']) && $r['cookie_id'] === $cookie_id) {
+            $is_match = true;
+        } elseif (!empty($local_id) && !empty($r['local_id']) && $r['local_id'] === $local_id) {
+            $is_match = true;
+        } elseif (!$has_device_id && !empty($ip) && $ip !== '127.0.0.1' && $ip !== '::1' && !empty($r['ip']) && $r['ip'] === $ip) {
+            // 2. Only fall back to IP matching if request has no device identification (e.g. curl / automated bot / disabled JS)
+            // For distinct physical devices with different hardware fingerprints, do NOT punish them just because they share the same Wi-Fi / NAT IP.
+            $is_match = true;
+        }
+
+        if ($is_match) {
+            $key = $r['email'] ?? ($r['timestamp'] . '');
+            $matched_emails[$key] = true;
+        }
+    }
+    return count($matched_emails);
+}
+
+function parse_clean_email_body($headers_raw, $body_raw)
+{
+    $text = trim($body_raw);
+    if (empty($text)) return '';
+
+    // Check if multipart MIME
+    $combined = $headers_raw . "\n" . $body_raw;
+    $boundary = null;
+    if (preg_match('/boundary="?([^"\r\n;]+)"?/i', $combined, $bm)) {
+        $boundary = trim($bm[1]);
+    } elseif (preg_match('/^--([a-zA-Z0-9_\-+=]{4,})/m', $body_raw, $bm2)) {
+        $boundary = trim($bm2[1]);
+    }
+
+    if ($boundary) {
+        $boundary_delim = (substr($boundary, 0, 2) === '--') ? $boundary : ('--' . $boundary);
+        $parts = explode($boundary_delim, $text);
+        $preferred_plain = '';
+        $fallback_html = '';
+
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if (empty($part) || $part === '--') continue;
+
+            $split = preg_split("/\r?\n\r?\n/", $part, 2);
+            $p_headers = $split[0] ?? '';
+            $p_body = $split[1] ?? $part;
+
+            $is_plain = (stripos($p_headers, 'text/plain') !== false) || (!stripos($p_headers, 'text/html') && !stripos($p_headers, 'content-type'));
+            $is_html = (stripos($p_headers, 'text/html') !== false);
+            $is_base64 = (stripos($p_headers, 'base64') !== false) || (preg_match('/^[a-zA-Z0-9+\/=\s]{20,}$/', trim($p_body)));
+            $is_qp = (stripos($p_headers, 'quoted-printable') !== false);
+
+            $decoded = trim($p_body);
+            if ($is_base64) {
+                $cleaned = preg_replace('/\s+/', '', $decoded);
+                $b64 = @base64_decode($cleaned);
+                if ($b64 !== false && !empty($b64)) $decoded = $b64;
+            } elseif ($is_qp) {
+                $decoded = quoted_printable_decode($decoded);
+            }
+
+            if ($is_plain && empty($preferred_plain) && !empty($decoded)) {
+                $preferred_plain = trim($decoded);
+            } elseif ($is_html && empty($fallback_html) && !empty($decoded)) {
+                $fallback_html = trim(strip_tags($decoded));
+            }
+        }
+
+        if (!empty($preferred_plain)) return $preferred_plain;
+        if (!empty($fallback_html)) return $fallback_html;
+    }
+
+    // Check single-part base64
+    if (stripos($headers_raw, 'base64') !== false || stripos($text, 'Content-Transfer-Encoding: base64') !== false) {
+        $split = preg_split("/\r?\n\r?\n/", $text, 2);
+        $content = isset($split[1]) ? $split[1] : $text;
+        $cleaned = preg_replace('/\s+/', '', $content);
+        $b64 = @base64_decode($cleaned);
+        if ($b64 !== false && !empty($b64)) return $b64;
+    }
+
+    // Check single-part quoted-printable
+    if (stripos($headers_raw, 'quoted-printable') !== false || stripos($text, 'Content-Transfer-Encoding: quoted-printable') !== false) {
+        $split = preg_split("/\r?\n\r?\n/", $text, 2);
+        $content = isset($split[1]) ? $split[1] : $text;
+        return quoted_printable_decode($content);
+    }
+
+    return $text;
+}
+
+function extract_windscribe_confirm_link($content)
+{
+    if (empty($content)) return null;
+    // 1. Check href attribute in HTML (e.g. href="https://windscribe.com/signup/confirmemail/...")
+    if (preg_match('/href=[\'"]([^\'"]*confirmemail[^\'"]*)[\'"]/i', $content, $m)) {
+        return html_entity_decode(trim($m[1]));
+    }
+    // 2. Check full url with confirmemail
+    if (preg_match('/https?:\/\/(?:www\.)?windscribe\.com\/[^\s"\'<>]*confirmemail[^\s"\'<>]*/i', $content, $m)) {
+        return html_entity_decode(trim($m[0], '."\'()'));
+    }
+    // 3. Fallback for any confirmemail link
+    if (preg_match('/https?:\/\/[^\s"\'<>]*confirmemail[^\s"\'<>]*/i', $content, $m)) {
+        return html_entity_decode(trim($m[0], '."\'()'));
+    }
+    return null;
+}
+
+function AddHistory($config, $config_count)
+{
+
+    global $history_file;
+    global $API_KEY;
+
+    if (!file_exists($history_file)) {
+        $history = [];
+    } else {
+        $history = json_decode(decrypt_config(file_get_contents($history_file)), true);
+        if (!is_array(value: $history)) {
+            $history = [];
+        }
+    }
+
+    if (!empty($history)) {
+        $last_version = end($history)["version"];
+        [$x, $y] = explode('.', $last_version);
+        $x = (int) $x;
+        $y = (int) $y;
+
+        if (++$y >= 10) {
+            $y = 0;
+            $x++;
+        }
+    } else {
+        $x = 1;
+        $y = 0;
+    }
+
+    $date = new DateTime("now", new DateTimeZone("Asia/Tehran"));
+    $timestamp = $date->format('Y/m/d H:i');
+
+    $new_config = [
+        "content" => $config,
+        "count" => $config_count,
+        "timestamp" => $timestamp,
+        "version" => "{$x}.{$y}"
+    ];
+
+    $history[] = $new_config;
+
+    $hashed = encrypt_config(json_encode($history, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    file_put_contents($history_file, $hashed);
+
+}
+
+function LoginHistory($role, $time, $success, $token, $last_time)
+{
+    global $login_file;
+
+    if (!file_exists($login_file)) {
+        $history = [];
+    } else {
+        $history = json_decode(file_get_contents($login_file), true);
+        if (!is_array($history)) {
+            $history = [];
+        }
+    }
+
+    $id = end($history)['id'] + 1;
+
+    $new_login = [
+        'id' => $id,
+        'role' => $role,
+        'time' => $time,
+        'success' => $success,
+        'token' => $token,
+        'last_time' => $last_time,
+        'ip' => $_SERVER['REMOTE_ADDR'],
+        'agent' => $_SERVER['HTTP_USER_AGENT']
+    ];
+
+    foreach ($history as $element) {
+        if ($element === $new_login) {
+            return "Exist";
+        }
+    }
+
+    $history[] = $new_login;
+
+    file_put_contents($login_file, json_encode($history, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+}
+
+if ($path == 'auth-login') {
+    $get_json = file_get_contents("php://input");
+    $get_data = json_decode($get_json, true);
+    $username = htmlspecialchars(strip_tags(trim($get_data['username'])));
+    $password = htmlspecialchars(strip_tags(trim($get_data['password'])));
+    $role = htmlspecialchars(strip_tags(trim($get_data['role'])));
+
+    $correct_username = ($role == 'admin') ? $ADMIN_USERNAME : $USER_USERNAME;
+    $correct_password = ($role == 'admin') ? $ADMIN_PASSWORD : $USER_PASSWORD;
+
+    if (password_verify($username, $correct_username) && password_verify($password, $correct_password)) {
+
+        $payload = [
+            'username' => $username,
+            'role' => $role,
+            'time' => time(),
+            'exp' => time() + 86400,
+        ];
+        $jwt_token = JWT::encode($payload, $JWT_SECRET_KEY, 'HS256');
+        $result = true;
+        LoginHistory($role, time(), true, $jwt_token, time());
+
+    } else {
+        $result = false;
+        $jwt_token = '';
+        LoginHistory($role, time(), false, $jwt_token, time());
+    }
+
+    echo json_encode([
+        'result' => $result,
+        'token' => $jwt_token
+    ]);
+
+    http_response_code(200);
+
+} elseif ($path == 'check-token') {
+    $get_json = file_get_contents("php://input");
+    $get_data = json_decode($get_json, true);
+    $token = htmlspecialchars(strip_tags(trim($get_data['token'])));
+
+    $token_decoded = JWT::decode($token, new Key($JWT_SECRET_KEY, 'HS256'));
+    $username = $token_decoded->username;
+    $role = $token_decoded->role;
+
+    $correct_username = ($role == 'admin') ? $ADMIN_USERNAME : $USER_USERNAME;
+
+    if (password_verify($username, $correct_username)) {
+        $result = true;
+    } else {
+        $result = false;
+    }
+
+    LoginHistory($role, time(), $result, $token, $token_decoded->time);
+
+    echo json_encode([
+        'result' => $result
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'get-config') {
+    $configs = decrypt_config(file_get_contents($config_file));
+    echo json_encode([
+        'config' => [$configs],
+    ]);
+
+    http_response_code(200);
+
+} elseif ($path == 'get-pxs') {
+    $pxs = decrypt_config(file_get_contents($px_file));
+    echo json_encode([
+        'pxs' => [$pxs],
+    ]);
+
+    http_response_code(200);
+
+} elseif ($path == 'get-history') {
+    $histories = json_decode(decrypt_config(file_get_contents($history_file)));
+    echo json_encode([
+        'history' => $histories
+    ]);
+
+    http_response_code(200);
+
+} elseif ($path == 'last-update') {
+    $histories = json_decode(decrypt_config(file_get_contents($history_file)));
+    $last_update = end($histories)->timestamp;
+    $count_config = end($histories)->count;
+
+    echo json_encode([
+        'count' => $count_config,
+        'timestamp' => $last_update
+    ]);
+
+    http_response_code(200);
+} elseif ($path == 'save-config') {
+
+    $get_json = file_get_contents("php://input");
+    $get_data = json_decode($get_json, true);
+    $new_config = $get_data['content'];
+
+    $config_count = substr_count($new_config, "\n");
+
+    AddHistory($new_config, $config_count);
+    file_put_contents($config_file, encrypt_config($new_config));
+    file_put_contents($sub_file_raw, $new_config);
+
+    $token = $GIT_TOKEN;
+    $repo = 'MojtabaZanganeh/A9Z-Configs';
+    $path_in_repo = 'A9Z-Configs.txt';
+    $branch = 'main';
+
+    $url = "https://api.github.com/repos/$repo/contents/$path_in_repo?ref=$branch";
+    $options = [
+        'http' => [
+            'method' => 'GET',
+            'header' => [
+                'User-Agent: PHP',
+                'Authorization: token ' . $token
+            ]
+        ]
+    ];
+
+    http_response_code(200);
+
+} elseif ($path == 'save-px') {
+    $get_json = file_get_contents("php://input");
+    $get_data = json_decode($get_json, true);
+    $new_px = $get_data['content'];
+
+    file_put_contents($px_file, encrypt_config($new_px));
+
+    http_response_code(200);
+
+} elseif ($path == 'get-sub') {
+    $sub_link = decrypt_config(file_get_contents($sub_file));
+
+    echo json_encode([
+        'sub' => $sub_link
+    ]);
+
+    http_response_code(200);
+
+} elseif ($path == 'get-links') {
+    $raw_content = file_exists($links_file) ? file_get_contents($links_file) : '';
+    $links = $raw_content ? json_decode(decrypt_config($raw_content)) : null;
+
+    echo json_encode([
+        'links' => [
+            'A9Z' => $links->A9Z ?? '',
+            'Android' => $links->Android ?? '',
+            'ios' => $links->ios ?? $links->iOS ?? '',
+            'Win32' => $links->Win32 ?? '',
+            'Win64' => $links->Win64 ?? '',
+            'ws_windows' => $links->ws_windows ?? '',
+            'ws_android' => $links->ws_android ?? '',
+            'ws_ios' => $links->ws_ios ?? '',
+            'ws_mac' => $links->ws_mac ?? ''
+        ]
+    ]);
+
+    http_response_code(200);
+
+} elseif ($path == 'save-sub') {
+
+    $get_json = file_get_contents("php://input");
+    $get_data = json_decode($get_json, true);
+
+    file_put_contents($sub_file, encrypt_config($get_data['sub']));
+
+} elseif ($path == 'save-links') {
+
+    $get_json = file_get_contents("php://input");
+    $get_data = json_decode($get_json, true);
+
+    $links = [
+        'A9Z' => $get_data['a9z'] ?? '',
+        'Android' => $get_data['android'] ?? '',
+        'ios' => $get_data['ios'] ?? '',
+        'Win32' => $get_data['win32'] ?? '',
+        'Win64' => $get_data['win64'] ?? '',
+        'ws_windows' => $get_data['ws_windows'] ?? '',
+        'ws_android' => $get_data['ws_android'] ?? '',
+        'ws_ios' => $get_data['ws_ios'] ?? '',
+        'ws_mac' => $get_data['ws_mac'] ?? ''
+    ];
+    file_put_contents($links_file, encrypt_config(json_encode($links, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)));
+
+    echo json_encode(['result' => true]);
+    http_response_code(200);
+
+} elseif ($path == 'get-settings') {
+    $settings = get_app_settings();
+    echo json_encode([
+        'success' => true,
+        'settings' => $settings
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'save-settings') {
+    $req_json = file_get_contents("php://input");
+    $req_data = json_decode($req_json, true) ?: [];
+    $input = isset($req_data['settings']) && is_array($req_data['settings']) ? $req_data['settings'] : $req_data;
+
+    $max_emails = isset($input['windscribe_max_emails']) ? max(1, (int)$input['windscribe_max_emails']) : 3;
+    $period_days = isset($input['windscribe_period_days']) ? max(1, (int)$input['windscribe_period_days']) : 30;
+    $lifespan_minutes = isset($input['windscribe_lifespan_minutes']) ? max(1, (int)$input['windscribe_lifespan_minutes']) : 5;
+
+    $settings = [
+        'windscribe_max_emails' => $max_emails,
+        'windscribe_period_days' => $period_days,
+        'windscribe_lifespan_minutes' => $lifespan_minutes
+    ];
+
+    $settings_file = get_storage_path('settings.json');
+    file_put_contents($settings_file, json_encode($settings, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+
+    echo json_encode([
+        'success' => true,
+        'settings' => $settings,
+        'message' => 'تنظیمات با موفقیت ذخیره شد'
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'get-windscribe-quota') {
+    $settings = get_app_settings();
+    $max_emails = $settings['windscribe_max_emails'];
+    $period_days = $settings['windscribe_period_days'];
+
+    $req_json = file_get_contents("php://input");
+    $req_data = json_decode($req_json, true) ?: [];
+    $fingerprint = trim($req_data['fingerprint'] ?? '');
+    $cookie_id = trim($_COOKIE['wsc_cid_v1'] ?? ($req_data['cookie_id'] ?? ''));
+    $local_id = trim($req_data['local_id'] ?? '');
+    $client_ip = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+
+    $used = get_windscribe_usage_count($fingerprint, $cookie_id, $local_id, $client_ip, $period_days);
+    echo json_encode([
+        'success' => true,
+        'used' => $used,
+        'max' => $max_emails,
+        'remaining' => max(0, $max_emails - $used),
+        'period_days' => $period_days,
+        'lifespan_minutes' => $settings['windscribe_lifespan_minutes'] ?? 5
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'create-windscribe-email') {
+    $cpanel_user = $_ENV['CPANEL_USER'] ?? '';
+    $cpanel_token = $_ENV['CPANEL_API_TOKEN'] ?? '';
+    $cpanel_host = $_ENV['CPANEL_HOST'] ?? '127.0.0.1';
+    $cpanel_domain = $_ENV['CPANEL_DOMAIN'] ?? 'a9z.ir';
+
+    $req_json = file_get_contents("php://input");
+    $req_data = json_decode($req_json, true) ?: [];
+
+    $fingerprint = trim($req_data['fingerprint'] ?? '');
+    $cookie_id = trim($_COOKIE['wsc_cid_v1'] ?? ($req_data['cookie_id'] ?? ''));
+    $local_id = trim($req_data['local_id'] ?? '');
+    $client_ip = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $is_user_request = !empty($req_data['is_user_request']);
+
+    // Check rate limit based on settings
+    $settings = get_app_settings();
+    $max_emails = $settings['windscribe_max_emails'];
+    $period_days = $settings['windscribe_period_days'];
+
+    if ($is_user_request) {
+        $usage_count = get_windscribe_usage_count($fingerprint, $cookie_id, $local_id, $client_ip, $period_days);
+        if ($usage_count >= $max_emails) {
+            echo json_encode([
+                'success' => false,
+                'rate_limited' => true,
+                'error' => 'rate_limited',
+                'message' => "سقف مجاز شما برای ساخت ایمیل (حداکثر {$max_emails} ایمیل در هر {$period_days} روز) تکمیل شده است.",
+                'used' => $usage_count,
+                'max' => $max_emails,
+                'period_days' => $period_days
+            ]);
+            http_response_code(200);
+            exit;
+        }
+    }
+
+    // Email format: prefix wsc_ followed by combination of letters and digits, domain @a9z.ir
+    $custom_user = trim($req_data['username'] ?? '');
+    if (!empty($custom_user)) {
+        $clean_user = strtolower(preg_replace('/[^a-zA-Z0-9_]/', '', $custom_user));
+        if (substr($clean_user, 0, 4) !== 'wsc_') {
+            $mailbox_name = 'wsc_' . $clean_user;
+        } else {
+            $mailbox_name = $clean_user;
+        }
+    } else {
+        $chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+        $rand_str = '';
+        for ($i = 0; $i < 6; $i++) {
+            $rand_str .= $chars[random_int(0, strlen($chars) - 1)];
+        }
+        $mailbox_name = 'wsc_' . $rand_str;
+    }
+
+    $email = $mailbox_name . '@' . $cpanel_domain;
+    $custom_pass = trim($req_data['password'] ?? '');
+    // Guarantee 100/100 strength rating on cPanel (24 characters, all 4 char classes)
+    if (!empty($custom_pass)) {
+        if (strlen($custom_pass) < 20) {
+            $password = $custom_pass . '#' . generate_cpanel_100_password(24 - strlen($custom_pass) - 1);
+        } else {
+            $password = $custom_pass;
+        }
+    } else {
+        $password = generate_cpanel_100_password(24);
+    }
+
+    $cpanel_result = null;
+    $cpanel_configured = !empty($cpanel_user) && !empty($cpanel_token);
+    $cpanel_status = 0;
+    $cpanel_http_code = 0;
+    $cpanel_tested_url = '';
+
+    if (empty($cpanel_user) || empty($cpanel_token)) {
+        $cpanel_message = empty($cpanel_token) 
+            ? 'متغیر CPANEL_API_TOKEN در فایل .env هاست خالی است. برای ساخت خودکار باید در cPanel به منوی Security > Manage API Tokens بروید و توکن بسازید.'
+            : 'متغیر CPANEL_USER در فایل .env هاست خالی است.';
+    } else {
+        // Try configured host first, then fallbacks if connection is refused on 127.0.0.1
+        $hosts_to_try = array_unique(array_filter([$cpanel_host, '127.0.0.1', 'localhost', $cpanel_domain]));
+        $cpanel_message = 'تلاش برای اتصال به cPanel...';
+
+        foreach ($hosts_to_try as $host) {
+            $url = "https://{$host}:2083/execute/Email/add_pop";
+            $cpanel_tested_url = $url;
+            $data = [
+                'email' => $mailbox_name,
+                'domain' => $cpanel_domain,
+                'password' => $password,
+                'quota' => 250
+            ];
+
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                "Authorization: cpanel {$cpanel_user}:{$cpanel_token}"
+            ]);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 6);
+            $res = curl_exec($ch);
+            $curl_err = curl_error($ch);
+            $cpanel_http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($curl_err) {
+                $cpanel_message = "خطای اتصال به {$host}:2083: " . $curl_err;
+                continue; // Try next host candidate
+            }
+
+            if ($cpanel_http_code == 401 || $cpanel_http_code == 403) {
+                $cpanel_status = 0;
+                $cpanel_message = "خطای احراز هویت در cPanel (کد {$cpanel_http_code}): توکن CPANEL_API_TOKEN یا نام کاربری CPANEL_USER اشتباه است.";
+                break;
+            }
+
+            $cpanel_result = json_decode($res, true);
+            if ($cpanel_result && isset($cpanel_result['status']) && $cpanel_result['status'] == 1) {
+                $cpanel_status = 1;
+                $cpanel_message = 'ایمیل با موفقیت در cPanel ایجاد شد';
+                break;
+            } elseif ($cpanel_result && isset($cpanel_result['errors']) && !empty($cpanel_result['errors'])) {
+                $cpanel_status = 0;
+                $cpanel_message = implode(' | ', $cpanel_result['errors']);
+                break;
+            } else {
+                $cpanel_status = 0;
+                $cpanel_message = "پاسخ نامشخص از cPanel (کد {$cpanel_http_code})";
+                if (!empty($res)) {
+                    $cpanel_message .= ': ' . substr(strip_tags($res), 0, 100);
+                }
+            }
+        }
+    }
+
+    // If user request and cPanel failed, notify user with error
+    if ($is_user_request && $cpanel_status !== 1) {
+        echo json_encode([
+            'success' => false,
+            'error' => 'cpanel_failed',
+            'message' => 'ایمیل در cPanel ساخته نشد: ' . ($cpanel_message ?: 'خطای ارتباط با cPanel'),
+            'cpanel_info' => [
+                'configured' => $cpanel_configured,
+                'status' => $cpanel_status,
+                'message' => $cpanel_message
+            ]
+        ]);
+        http_response_code(200);
+        exit;
+    }
+
+    $ws_file = get_storage_path('windscribe_emails.json');
+    $records = [];
+    if (file_exists($ws_file)) {
+        $raw = file_get_contents($ws_file);
+        $records = json_decode($raw, true) ?: [];
+    }
+
+    $created_ts = time();
+    $lifespan_minutes = $settings['windscribe_lifespan_minutes'] ?? 5;
+    $expires_at = $created_ts + ($lifespan_minutes * 60);
+
+    $new_record = [
+        'id' => $mailbox_name,
+        'email' => $email,
+        'password' => $password,
+        'created_at' => date('Y-m-d H:i:s'),
+        'created_timestamp' => $created_ts,
+        'expires_at' => $expires_at,
+        'lifespan_minutes' => $lifespan_minutes,
+        'is_user_request' => !empty($is_user_request),
+        'code' => null,
+        'link' => null,
+        'status' => 'pending',
+        'cpanel_configured' => $cpanel_configured,
+        'cpanel_status' => $cpanel_status,
+        'cpanel_message' => $cpanel_message
+    ];
+    array_unshift($records, $new_record);
+    file_put_contents($ws_file, json_encode($records, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+
+    // Permanent lifetime history of all created emails (never deleted, survives expiration and admin deletion)
+    $history_file = get_storage_path('windscribe_emails_history.json');
+    $all_history = file_exists($history_file) ? (json_decode(file_get_contents($history_file), true) ?: []) : [];
+    $already_in_hist = false;
+    foreach ($all_history as &$he) {
+        if (($he['email'] ?? '') === $email) {
+            $already_in_hist = true;
+            break;
+        }
+    }
+    if (!$already_in_hist) {
+        $all_history[] = $new_record;
+        file_put_contents($history_file, json_encode($all_history, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    }
+
+    // Record usage for rate limiting (3 emails per 30 days)
+    if ($is_user_request) {
+        $quota_file = get_storage_path('windscribe_quota.json');
+        $q_records = file_exists($quota_file) ? (json_decode(file_get_contents($quota_file), true) ?: []) : [];
+        $q_records[] = [
+            'email' => $email,
+            'timestamp' => time(),
+            'ip' => $client_ip,
+            'fingerprint' => $fingerprint,
+            'cookie_id' => $cookie_id,
+            'local_id' => $local_id
+        ];
+        file_put_contents($quota_file, json_encode($q_records, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    }
+
+    echo json_encode([
+        'success' => true,
+        'data' => $new_record,
+        'cpanel_info' => [
+            'configured' => $cpanel_configured,
+            'status' => $cpanel_status,
+            'message' => $cpanel_message
+        ],
+        'cpanel_raw' => $cpanel_result
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'delete-windscribe-email') {
+    $req_json = file_get_contents("php://input");
+    $req_data = json_decode($req_json, true) ?: [];
+    $target_email = trim($req_data['email'] ?? '');
+    $is_admin = !empty($req_data['is_admin_deletion']) || !empty($req_data['admin']);
+    $norm_target = strtolower($target_email);
+
+    $cpanel_user = $_ENV['CPANEL_USER'] ?? '';
+    $cpanel_token = $_ENV['CPANEL_API_TOKEN'] ?? '';
+    $cpanel_host = $_ENV['CPANEL_HOST'] ?? '127.0.0.1';
+    $cpanel_domain = $_ENV['CPANEL_DOMAIN'] ?? 'a9z.ir';
+
+    $email_parts = explode('@', $target_email);
+    $mailbox_name = $email_parts[0];
+    $domain_name = $email_parts[1] ?? $cpanel_domain;
+
+    $cpanel_result = null;
+    if (!empty($cpanel_user) && !empty($cpanel_token) && !empty($mailbox_name)) {
+        $url = "https://{$cpanel_host}:2083/execute/Email/delete_pop";
+        $data = [
+            'email' => $mailbox_name,
+            'domain' => $domain_name
+        ];
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            "Authorization: cpanel {$cpanel_user}:{$cpanel_token}"
+        ]);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        $res = curl_exec($ch);
+        curl_close($ch);
+        $cpanel_result = json_decode($res, true);
+    }
+
+    $ws_file = get_storage_path('windscribe_emails.json');
+    $records = [];
+    if (file_exists($ws_file)) {
+        $raw = file_get_contents($ws_file);
+        $records = json_decode($raw, true) ?: [];
+    }
+
+    $records = array_values(array_filter($records, function ($item) use ($norm_target) {
+        return strtolower(trim($item['email'] ?? '')) !== $norm_target;
+    }));
+
+    file_put_contents($ws_file, json_encode($records, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+
+    // Also record in deleted_emails.json so deleted status is always preserved
+    $del_file = get_storage_path('deleted_emails.json');
+    $deleted_list = file_exists($del_file) ? (json_decode(file_get_contents($del_file), true) ?: []) : [];
+    $deleted_list[$norm_target] = [
+        'email' => $target_email,
+        'deleted_at' => date('Y-m-d H:i:s'),
+        'timestamp' => time(),
+        'deleted_by_admin' => $is_admin
+    ];
+    file_put_contents($del_file, json_encode($deleted_list, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+
+    echo json_encode([
+        'success' => true,
+        'email' => $target_email,
+        'deleted_by_admin' => $is_admin,
+        'cpanel' => $cpanel_result
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'check-windscribe-code') {
+    $get_json = file_get_contents("php://input");
+    $get_data = json_decode($get_json, true);
+    $target_email = trim($get_data['email'] ?? '');
+    $norm_target = strtolower($target_email);
+
+    // 1. Check if explicitly deleted by admin
+    $del_file = get_storage_path('deleted_emails.json');
+    $deleted_list = file_exists($del_file) ? (json_decode(file_get_contents($del_file), true) ?: []) : [];
+    if (isset($deleted_list[$norm_target]) && !empty($deleted_list[$norm_target]['deleted_by_admin'])) {
+        echo json_encode([
+            'success' => false,
+            'deleted_by_admin' => true,
+            'error' => 'email_deleted',
+            'message' => 'این ایمیل توسط مدیر حذف گردیده است.',
+            'email' => $target_email
+        ]);
+        http_response_code(200);
+        exit;
+    }
+
+    $ws_file = get_storage_path('windscribe_emails.json');
+    $records = [];
+    if (file_exists($ws_file)) {
+        $raw = file_get_contents($ws_file);
+        $records = json_decode($raw, true) ?: [];
+    }
+
+    $found_code = null;
+    $found_link = null;
+    $found_subject = null;
+    $message = 'در انتظار دریافت کد از وینداسکرایب';
+
+    $target_rec = null;
+    foreach ($records as &$rec) {
+        if (strtolower(trim($rec['email'] ?? '')) === $norm_target) {
+            $target_rec = &$rec;
+            break;
+        }
+    }
+
+    if (!$target_rec) {
+        // Check if preserved in history (already verified or received link)
+        $history_file = get_storage_path('windscribe_emails_history.json');
+        $all_history = file_exists($history_file) ? (json_decode(file_get_contents($history_file), true) ?: []) : [];
+        foreach ($all_history as $h) {
+            if (strtolower(trim($h['email'] ?? '')) === $norm_target) {
+                echo json_encode([
+                    'success' => true,
+                    'email' => $target_email,
+                    'code' => $h['code'] ?? null,
+                    'link' => $h['link'] ?? null,
+                    'subject' => $h['subject'] ?? null,
+                    'status' => $h['status'] ?? 'verified',
+                    'message' => !empty($h['link']) ? 'لینک تایید حساب دریافت شد' : 'ایمیل در تاریخچه ثبت است',
+                    'messages' => $h['messages'] ?? []
+                ]);
+                http_response_code(200);
+                exit;
+            }
+        }
+
+        echo json_encode([
+            'success' => false,
+            'deleted_by_admin' => false,
+            'error' => 'waiting',
+            'message' => 'در انتظار دریافت کد از وینداسکرایب',
+            'email' => $target_email
+        ]);
+        http_response_code(200);
+        exit;
+    }
+
+    $all_messages = [];
+    $debug_info = [];
+    $cpanel_user = $_ENV['CPANEL_USER'] ?? '';
+    $cpanel_domain = $_ENV['CPANEL_DOMAIN'] ?? 'a9z.ir';
+
+    // 1. Direct Maildir filesystem reading (Fastest and Most Reliable on cPanel)
+    $email_parts = explode('@', $target_email);
+    $mailbox_name = $email_parts[0];
+    $domain_name = $email_parts[1] ?? $cpanel_domain;
+
+    $possible_base_dirs = [];
+    if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+        $doc_root_parent = dirname($_SERVER['DOCUMENT_ROOT']);
+        $possible_base_dirs[] = $doc_root_parent;
+        // Check if public_html parent
+        if (basename($_SERVER['DOCUMENT_ROOT']) === 'public_html') {
+            $possible_base_dirs[] = $doc_root_parent;
+        }
+    }
+    if (!empty($cpanel_user)) {
+        $possible_base_dirs[] = "/home/{$cpanel_user}";
+    }
+    $possible_base_dirs[] = getenv('HOME');
+    $possible_base_dirs[] = '/home/' . (get_current_user() ?: '');
+
+    $possible_base_dirs = array_unique(array_filter($possible_base_dirs));
+    $checked_dirs = [];
+
+    foreach ($possible_base_dirs as $base) {
+        $maildir_targets = [
+            "{$base}/mail/{$domain_name}/{$mailbox_name}/new",
+            "{$base}/mail/{$domain_name}/{$mailbox_name}/cur",
+            "{$base}/mail/{$mailbox_name}/new",
+            "{$base}/mail/{$mailbox_name}/cur"
+        ];
+
+        // Also check catch-all primary mailbox if configured
+        if (!empty($_ENV['CATCHALL_EMAIL'])) {
+            $catch_parts = explode('@', $_ENV['CATCHALL_EMAIL']);
+            $catch_box = $catch_parts[0];
+            $catch_dom = $catch_parts[1] ?? $domain_name;
+            $maildir_targets[] = "{$base}/mail/{$catch_dom}/{$catch_box}/new";
+            $maildir_targets[] = "{$base}/mail/{$catch_dom}/{$catch_box}/cur";
+        }
+
+        foreach ($maildir_targets as $mdir) {
+            $checked_dirs[] = $mdir;
+            if (is_dir($mdir)) {
+                $files = @scandir($mdir);
+                if ($files) {
+                    foreach ($files as $file) {
+                        if ($file === '.' || $file === '..') continue;
+                        $filepath = $mdir . '/' . $file;
+                        if (!is_file($filepath)) continue;
+
+                        $raw_eml = @file_get_contents($filepath);
+                        if (!$raw_eml) continue;
+
+                        // Parse RFC 822 EML message
+                        $parts = preg_split("/\r?\n\r?\n/", $raw_eml, 2);
+                        $headers_raw = $parts[0] ?? '';
+                        $body_raw = $parts[1] ?? '';
+
+                        // Subject
+                        $subject = '(بدون موضوع)';
+                        if (preg_match('/^Subject:\s*(.*)$/mi', $headers_raw, $sm)) {
+                            $subject = trim($sm[1]);
+                            if (function_exists('iconv_mime_decode')) {
+                                $subject = iconv_mime_decode($subject, 0, 'UTF-8');
+                            }
+                        }
+
+                        // From
+                        $from = 'نامشخص';
+                        if (preg_match('/^From:\s*(.*)$/mi', $headers_raw, $fm)) {
+                            $from = trim($fm[1]);
+                            if (function_exists('iconv_mime_decode')) {
+                                $from = iconv_mime_decode($from, 0, 'UTF-8');
+                            }
+                        }
+
+                        // Date
+                        $date = date('Y-m-d H:i:s', filemtime($filepath));
+                        if (preg_match('/^Date:\s*(.*)$/mi', $headers_raw, $dm)) {
+                            $date = trim($dm[1]);
+                        }
+
+                        // Decode Transfer Encoding & MIME multiparts cleanly
+                        $body = parse_clean_email_body($headers_raw, $body_raw);
+
+                        $msg_code = null;
+                        if (preg_match('/\b([0-9]{5,6})\b/', $body, $m)) {
+                            $msg_code = $m[1];
+                        }
+                        $msg_link = extract_windscribe_confirm_link($raw_eml) ?: extract_windscribe_confirm_link($body_raw) ?: extract_windscribe_confirm_link($body);
+
+                        if (!$found_link && $msg_link) {
+                            $found_link = $msg_link;
+                            $found_subject = $subject;
+                        }
+                        if (!$found_code && $msg_code) {
+                            $found_code = $msg_code;
+                            if (!$found_subject) $found_subject = $subject;
+                        }
+
+                        $all_messages[] = [
+                            'id' => md5($file),
+                            'from' => $from,
+                            'subject' => $subject,
+                            'date' => $date,
+                            'body' => $body,
+                            'code' => $msg_code,
+                            'link' => $msg_link
+                        ];
+                    }
+                }
+            }
+        }
+    }
+
+    $debug_info['maildir_messages'] = count($all_messages);
+    $debug_info['checked_dirs'] = $checked_dirs;
+
+    // 2. Fallback to IMAP if Maildir found no messages and IMAP is available
+    if (empty($all_messages) && $target_rec && !empty($target_rec['password']) && function_exists('imap_open')) {
+        @imap_timeout(IMAP_OPENTIMEOUT, 3);
+        @imap_timeout(IMAP_READTIMEOUT, 3);
+
+        $imap_host = $_ENV['IMAP_HOST'] ?? '127.0.0.1';
+        $imap_port = $_ENV['IMAP_PORT'] ?? 993;
+        
+        $mailboxes = [
+            "{{$imap_host}:{$imap_port}/imap/ssl/novalidate-cert}INBOX",
+            "{{$imap_host}:143/imap/notls}INBOX",
+            "{localhost:993/imap/ssl/novalidate-cert}INBOX",
+            "{localhost:143/imap/notls}INBOX"
+        ];
+        
+        $imap_user = $target_rec['email'];
+        $imap_pass = $target_rec['password'];
+
+        if (!empty($_ENV['CATCHALL_EMAIL']) && !empty($_ENV['CATCHALL_PASSWORD'])) {
+            $imap_user = $_ENV['CATCHALL_EMAIL'];
+            $imap_pass = $_ENV['CATCHALL_PASSWORD'];
+        }
+
+        $inbox = false;
+        foreach ($mailboxes as $mbox) {
+            $inbox = @imap_open($mbox, $imap_user, $imap_pass, OP_READONLY, 1, ['DISABLE_AUTHENTICATOR' => 'GSSAPI']);
+            if ($inbox) break;
+        }
+
+        if ($inbox) {
+            $num_messages = imap_num_msg($inbox);
+            if ($num_messages > 0) {
+                for ($num = $num_messages; $num >= max(1, $num_messages - 30); $num--) {
+                    $header = imap_headerinfo($inbox, $num);
+                    $from = $header->fromaddress ?? ($header->from[0]->mailbox . '@' . $header->from[0]->host ?? 'Unknown');
+                    $subject = $header->subject ?? '(بدون موضوع)';
+                    $date = $header->date ?? date('Y-m-d H:i:s');
+                    $raw_body = imap_body($inbox, $num);
+
+                    $body = parse_clean_email_body('', $raw_body);
+
+                    $msg_code = null;
+                    if (preg_match('/\b([0-9]{5,6})\b/', $body, $m)) {
+                        $msg_code = $m[1];
+                    }
+                    $msg_link = extract_windscribe_confirm_link($raw_body) ?: extract_windscribe_confirm_link($body);
+
+                    if (!$found_link && $msg_link) {
+                        $found_link = $msg_link;
+                        $found_subject = $subject;
+                    }
+                    if (!$found_code && $msg_code) {
+                        $found_code = $msg_code;
+                        if (!$found_subject) $found_subject = $subject;
+                    }
+
+                    $all_messages[] = [
+                        'id' => $num,
+                        'from' => $from,
+                        'subject' => $subject,
+                        'date' => $date,
+                        'body' => $body,
+                        'code' => $msg_code,
+                        'link' => $msg_link
+                    ];
+                }
+            }
+            imap_close($inbox);
+        } else {
+            $debug_info['imap_last_error'] = imap_last_error();
+        }
+    }
+
+    if ($target_rec) {
+        if ($found_link || $found_code) {
+            $target_rec['code'] = $found_code;
+            $target_rec['link'] = $found_link;
+            $target_rec['status'] = 'verified';
+            $message = !empty($found_link) ? 'لینک تایید حساب دریافت شد' : 'کد با موفقیت دریافت شد';
+        }
+        $target_rec['messages'] = $all_messages;
+        $target_rec['last_checked'] = date('Y-m-d H:i:s');
+        file_put_contents($ws_file, json_encode($records, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+
+        // Also update in windscribe_emails_history.json
+        $history_file = get_storage_path('windscribe_emails_history.json');
+        if (file_exists($history_file)) {
+            $hist = json_decode(file_get_contents($history_file), true) ?: [];
+            $updated_hist = false;
+            foreach ($hist as &$h_rec) {
+                if (($h_rec['email'] ?? '') === $target_email) {
+                    if ($found_code) $h_rec['code'] = $found_code;
+                    if ($found_link) $h_rec['link'] = $found_link;
+                    if ($found_link || $found_code) $h_rec['status'] = 'verified';
+                    $h_rec['last_checked'] = date('Y-m-d H:i:s');
+                    $updated_hist = true;
+                    break;
+                }
+            }
+            if ($updated_hist) {
+                file_put_contents($history_file, json_encode($hist, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+            }
+        }
+    }
+
+    echo json_encode([
+        'success' => true,
+        'email' => $target_email,
+        'code' => $target_rec['code'] ?? $found_code,
+        'link' => $target_rec['link'] ?? $found_link,
+        'subject' => $found_subject,
+        'status' => $target_rec['status'] ?? 'pending',
+        'message' => $message,
+        'messages' => $all_messages,
+        'debug' => $debug_info
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'get-windscribe-emails') {
+    $ws_file = get_storage_path('windscribe_emails.json');
+    $records = [];
+    if (file_exists($ws_file)) {
+        $raw = file_get_contents($ws_file);
+        $records = json_decode($raw, true) ?: [];
+    }
+
+    $now = time();
+    foreach ($records as &$rec) {
+        $email_addr = $rec['email'] ?? '';
+        if (!isset($rec['is_user_request'])) {
+            $rec['is_user_request'] = (strpos($email_addr, 'wsc_') === 0);
+        }
+        if (!isset($rec['created_timestamp'])) {
+            $rec['created_timestamp'] = !empty($rec['created_at']) ? strtotime($rec['created_at']) : $now;
+        }
+        if (!isset($rec['expires_at'])) {
+            $rec['expires_at'] = $rec['created_timestamp'] + 300;
+        }
+        $rec['is_expired'] = ($now >= $rec['expires_at']);
+        $rec['remaining_seconds'] = max(0, $rec['expires_at'] - $now);
+    }
+
+    echo json_encode([
+        'success' => true,
+        'emails' => $records
+    ]);
+    http_response_code(200);
+
+} elseif ($path == 'get-stats') {
+    // 1. Logins statistics
+    $login_file = get_storage_path('login.json');
+    $logins = file_exists($login_file) ? (json_decode(file_get_contents($login_file), true) ?: []) : [];
+
+    $user_logins = 0;
+    $admin_logins = 0;
+    $failed_logins = 0;
+    $unique_login_ips = [];
+
+    $now = time();
+    $daily_cutoff = $now - 86400; // 24h
+    $weekly_cutoff = $now - (7 * 86400); // 7 days
+    $monthly_cutoff = $now - (30 * 86400); // 30 days
+    $yearly_cutoff = $now - (365 * 86400); // 365 days
+
+    $daily_user_logins = 0;
+    $weekly_user_logins = 0;
+    $monthly_user_logins = 0;
+    $yearly_user_logins = 0;
+
+    foreach ($logins as $l) {
+        $is_user = (($l['role'] ?? '') !== 'admin');
+        if (!empty($l['success'])) {
+            if (!$is_user) {
+                $admin_logins++;
+            } else {
+                $user_logins++;
+
+                $t = 0;
+                if (!empty($l['time']) && is_numeric($l['time'])) {
+                    $t = (int)$l['time'];
+                } elseif (!empty($l['last_time']) && is_numeric($l['last_time'])) {
+                    $t = (int)$l['last_time'];
+                } elseif (!empty($l['timestamp'])) {
+                    $t = is_numeric($l['timestamp']) ? (int)($l['timestamp'] > 1e11 ? $l['timestamp']/1000 : $l['timestamp']) : (strtotime($l['timestamp']) ?: 0);
+                } elseif (!empty($l['time']) && is_string($l['time'])) {
+                    $t = strtotime($l['time']) ?: 0;
+                }
+                if ($t === 0) $t = $now;
+
+                if ($t >= $daily_cutoff) $daily_user_logins++;
+                if ($t >= $weekly_cutoff) $weekly_user_logins++;
+                if ($t >= $monthly_cutoff) $monthly_user_logins++;
+                if ($t >= $yearly_cutoff) $yearly_user_logins++;
+            }
+        } else {
+            $failed_logins++;
+        }
+        if (!empty($l['ip'])) {
+            $unique_login_ips[$l['ip']] = true;
+        }
+    }
+
+    // Return all logins without slice limit so frontend pagination can show every record (e.g. all 41+)
+    $recent_logins = array_reverse($logins);
+
+    // 2. Windscribe emails stats - All-Time Cumulative Count
+    // Counts all emails ever created/registered, even if deleted by admin or user-created and expired
+    $ws_file = get_storage_path('windscribe_emails.json');
+    $records = file_exists($ws_file) ? (json_decode(file_get_contents($ws_file), true) ?: []) : [];
+
+    $del_file = get_storage_path('deleted_emails.json');
+    $deleted_records = file_exists($del_file) ? (json_decode(file_get_contents($del_file), true) ?: []) : [];
+
+    $history_file = get_storage_path('windscribe_emails_history.json');
+    $history_records = file_exists($history_file) ? (json_decode(file_get_contents($history_file), true) ?: []) : [];
+
+    $quota_file = get_storage_path('windscribe_quota.json');
+    $quota_records = file_exists($quota_file) ? (json_decode(file_get_contents($quota_file), true) ?: []) : [];
+
+    // Aggregate unique all-time created emails
+    $all_time_emails_map = [];
+
+    // 1) From permanent history file
+    foreach ($history_records as $hr) {
+        $em = strtolower(trim($hr['email'] ?? ''));
+        if ($em) {
+            $all_time_emails_map[$em] = $hr;
+        }
+    }
+
+    // 2) From current active emails
+    foreach ($records as $r) {
+        $em = strtolower(trim($r['email'] ?? ''));
+        if ($em) {
+            if (!isset($all_time_emails_map[$em])) {
+                $all_time_emails_map[$em] = $r;
+            } else {
+                if (!empty($r['link']) || !empty($r['code']) || ($r['status'] ?? '') === 'verified') {
+                    $all_time_emails_map[$em]['status'] = 'verified';
+                    if (!empty($r['link'])) $all_time_emails_map[$em]['link'] = $r['link'];
+                    if (!empty($r['code'])) $all_time_emails_map[$em]['code'] = $r['code'];
+                }
+            }
+        }
+    }
+
+    // 3) From deleted emails
+    foreach ($deleted_records as $k => $dv) {
+        $em = strtolower(trim(is_array($dv) ? ($dv['email'] ?? $k) : (is_string($k) && strpos($k, '@') !== false ? $k : $dv)));
+        if ($em && !isset($all_time_emails_map[$em])) {
+            $all_time_emails_map[$em] = [
+                'email' => $em,
+                'is_deleted' => true,
+                'is_user_request' => (strpos($em, 'wsc_') === 0)
+            ];
+        }
+    }
+
+    // 4) From quota records (user requested emails)
+    foreach ($quota_records as $qr) {
+        $em = strtolower(trim($qr['email'] ?? ''));
+        if ($em && !isset($all_time_emails_map[$em])) {
+            $all_time_emails_map[$em] = [
+                'email' => $em,
+                'is_user_request' => true
+            ];
+        }
+    }
+
+    // Sync back to history file if any active or deleted emails weren't recorded yet
+    if (count($all_time_emails_map) > count($history_records)) {
+        file_put_contents($history_file, json_encode(array_values($all_time_map ?? $all_time_emails_map), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    }
+
+    $total_emails = count($all_time_emails_map);
+    $verified_emails = 0;
+    $pending_emails = 0;
+    $active_emails = 0;
+    $user_created_emails = 0;
+    $admin_created_emails = 0;
+    $now = time();
+
+    foreach ($all_time_emails_map as $em => $rec) {
+        $is_user = !empty($rec['is_user_request']) || (strpos($em, 'wsc_') === 0);
+        if ($is_user) {
+            $user_created_emails++;
+        } else {
+            $admin_created_emails++;
+        }
+
+        if (!empty($rec['link']) || !empty($rec['code']) || ($rec['status'] ?? '') === 'verified') {
+            $verified_emails++;
+        } else {
+            $pending_emails++;
+        }
+    }
+
+    foreach ($records as $r) {
+        if (!empty($r['expires_at']) && $r['expires_at'] > $now) {
+            $active_emails++;
+        }
+    }
+
+    // 3. Unique users who received emails
+    $quota_file = get_storage_path('windscribe_quota.json');
+    $quota_records = file_exists($quota_file) ? (json_decode(file_get_contents($quota_file), true) ?: []) : [];
+
+    $unique_users_map = [];
+    foreach ($quota_records as $qr) {
+        $uid = !empty($qr['fingerprint']) ? $qr['fingerprint'] : (!empty($qr['cookie_id']) ? $qr['cookie_id'] : ($qr['ip'] ?? ''));
+        if (!empty($uid)) {
+            $unique_users_map[$uid] = true;
+        }
+    }
+    foreach ($records as $r) {
+        if (!empty($r['is_user_request'])) {
+            $uid = $r['fingerprint'] ?? ($r['cookie_id'] ?? ($r['ip'] ?? $r['email']));
+            if (!empty($uid)) {
+                $unique_users_map[$uid] = true;
+            }
+        }
+    }
+
+    $unique_users_count = count($unique_users_map);
+
+    // 4. Settings
+    $settings = get_app_settings();
+
+    $stats_payload = [
+        'logins' => [
+            'total_user_logins' => $user_logins,
+            'total_admin_logins' => $admin_logins,
+            'total_attempts' => count($logins),
+            'failed_logins' => $failed_logins,
+            'unique_ips' => count($unique_login_ips),
+            'daily_user_logins' => $daily_user_logins,
+            'weekly_user_logins' => $weekly_user_logins,
+            'monthly_user_logins' => $monthly_user_logins,
+            'yearly_user_logins' => $yearly_user_logins,
+            'recent_logins' => $recent_logins
+        ],
+        'emails' => [
+            'total_created' => $total_emails,
+            'user_created' => $user_created_emails,
+            'admin_created' => $admin_created_emails,
+            'total_verified' => $verified_emails,
+            'total_pending' => $pending_emails,
+            'active_not_expired' => $active_emails
+        ],
+        'users' => [
+            'unique_users_received_emails' => $unique_users_count,
+            'total_quota_records' => count($quota_records)
+        ],
+        'settings' => $settings
+    ];
+
+    echo json_encode([
+        'success' => true,
+        'stats' => $stats_payload,
+        'data' => $stats_payload
+    ]);
+    http_response_code(200);
+}

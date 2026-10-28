@@ -1,0 +1,8 @@
+{
+  "name": "A9Z",
+  "description": "دریافت کانفیگ‌های وی‌توری و پروکسی‌های تلگرام، آموزش نصب و راه اندازی Windscribe به همراه ایمیل موقت",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
